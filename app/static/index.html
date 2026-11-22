@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>虚拟机块池 · 快照与配额</h1>
-  <p class="sub">两块虚拟盘共享固定容量的 4 KiB 块池。系统盘可建一份只读快照。</p>
+  <p class="sub">两块虚拟盘共享固定容量的 4 KiB 块池。系统盘可建一份只读快照；数据盘可把相邻可压缩的块两两合装，腾出公共余量。</p>
 </header>
 
 <main>
@@ -30,6 +30,11 @@
         <span class="label">已占用物理块</span>
         <strong id="live-blocks">–</strong>
         <span class="unit">块</span>
+      </div>
+      <div class="gauge packed">
+        <span class="label">合装对数</span>
+        <strong id="packed-pairs">–</strong>
+        <span class="unit">对</span>
       </div>
       <div class="gauge muted">
         <span class="label">池总容量</span>
@@ -53,6 +58,25 @@
     <p class="hint">
       创建快照会共享系统盘当前块，并从公共余量中预留指定块数；
       覆写共用块时先用预留，预留用尽后使用公共余量。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>数据盘压缩合装</h2>
+    <div class="row">
+      <label>起始块号
+        <input id="pack-start" type="number" min="0" value="0" />
+      </label>
+      <label>连续块数（最多 64）
+        <input id="pack-count" type="number" min="1" max="64" value="8" />
+      </label>
+      <button id="pack-btn">压缩合装</button>
+    </div>
+    <p class="hint">
+      把数据盘上一段连续块号按相邻两块配对：两块各自无损压缩后都不超过 2 KiB，
+      就合装进同一个 4 KiB 槽，每对释放 1 个槽并立即归还公共余量（公共余量为 0
+      时也可执行）。未分配、已合装、压缩后超过 2 KiB 的块会自动跳过；奇数个块时
+      最后一块落单跳过。每个块号读出的仍是完整的 4 KiB。
     </p>
   </section>
 
@@ -87,7 +111,7 @@
       <button id="list-data">数据盘块表</button>
       <button id="list-snapshot">快照块表</button>
     </div>
-    <p class="hint">红色表示该物理块仍被快照共享；此时写入系统盘会分配新块。</p>
+    <p class="hint">红色表示该物理块仍被快照共享（写入系统盘会分配新块）；绿色“合装”表示该块与伙伴块压缩后合装在同一槽。</p>
     <table id="blocks-table">
       <thead>
         <tr><th>盘</th><th>逻辑块号</th><th>物理块</th><th>大小</th><th>内容预览</th><th>状态</th></tr>

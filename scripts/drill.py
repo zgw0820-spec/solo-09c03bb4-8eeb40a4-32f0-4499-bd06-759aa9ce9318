@@ -2,7 +2,7 @@
 """End-to-end drill against a running service (default http://127.0.0.1:8000).
 
 Usage:
-    python3 scripts/drill.py <base_url> [--phase A|B]
+    python3 scripts/drill.py <base_url> [--phase A|B|C]
 
 Both phases require an empty pool (fresh `docker compose down -v` /
 new DB file).  Use POOL_TOTAL_BLOCKS=8.
@@ -23,11 +23,23 @@ Phase B — deleting a snapshot that still has unused reservation:
     4. two shared overwrites are charged to the reservation -> 1 reserved left,
     5. deletion frees the 2 snapshot-only copies and returns the 1 unused
        reserved block; public free becomes 3 (4 sys + 1 data live).
+
+Phase C — packing with zero public free + both packed-overwrite outcomes:
+    1. fill the whole pool with compressible data blocks -> public = 0,
+    2. first write is refused (public = 0),
+    3. pack the data-disk range -> pairs share slots, freed slots immediately
+       return to public free; every LBA still reads back its full 4 KiB,
+    4. overwrite a packed block with compressible data -> stays in its slot,
+    5. overwrite a packed block with incompressible data -> split out using a
+       public slot, partner keeps the original slot and its content,
+    6. refill public free to 0, incompressible overwrite of a packed block
+       -> 409, both blocks and the free space unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -235,6 +247,103 @@ def phase_b(base: str) -> None:
           json.dumps(diag, ensure_ascii=False))
 
 
+def phase_c(base: str) -> None:
+    total = require_empty(base)["total_blocks"]
+
+    print("\n[C1] 用可压缩块填满数据盘（公共余量归零）")
+    for i in range(total):
+        code, body = call(base, "PUT", f"/api/disks/data/blocks/{i}",
+                          {"text": f"pack-{i}"})
+        assert code == 200, body
+    st = status(base)
+    show("填满后", st)
+    check("公共余量 = 0", st["public_free_blocks"] == 0)
+
+    print("\n[C2] 公共余量为 0 时首次写入被拒")
+    code, body = call(base, "PUT", f"/api/disks/data/blocks/{total}",
+                      {"text": "nope"})
+    check("首次写入 409 pool_full",
+          code == 409 and body.get("error", {}).get("code") == "pool_full",
+          json.dumps(body, ensure_ascii=False))
+
+    print("\n[C3] 公共余量为 0 时合装数据盘整段连续块号")
+    code, body = call(base, "POST", "/api/disks/data/pack",
+                      {"start_lba": 0, "count": total})
+    check("合装成功", code == 200, json.dumps(body, ensure_ascii=False))
+    expect = total // 2
+    check(f"合装 {expect} 对", body.get("packed_pairs") == expect,
+          f"实际 {body.get('packed_pairs')}")
+    check(f"实际释放 {expect} 槽", body.get("freed_slots") == expect,
+          f"实际 {body.get('freed_slots')}")
+    st = status(base)
+    show("合装后", st)
+    check("释放的槽立即归公共余量", st["public_free_blocks"] == expect)
+    check("总览显示合装对数", st["packed_pairs"] == expect)
+
+    print("\n[C4] 合装后每个块号仍读出完整 4 KiB 原文")
+    ok_all = True
+    for i in range(total):
+        code, b = call(base, "GET", f"/api/disks/data/blocks/{i}")
+        ok_all = (ok_all and code == 200 and b["text"] == f"pack-{i}"
+                  and b["size"] == 4096 and b["packed"] is True)
+    check("全部块号读回原文且标记合装", ok_all)
+
+    print("\n[C5] 改写合装块：压缩后仍 ≤ 2 KiB → 留在原槽")
+    slot0 = call(base, "GET", "/api/disks/data/blocks/0")[1]["pblock_id"]
+    free_before = status(base)["public_free_blocks"]
+    code, body = call(base, "PUT", "/api/disks/data/blocks/0",
+                      {"text": "pack-0-v2"})
+    check("改写成功", code == 200, json.dumps(body, ensure_ascii=False))
+    check("动作 = overwrite_packed", body.get("action") == "overwrite_packed")
+    check("留在原槽", body.get("pblock_id") == slot0)
+    check("公共余量不变", status(base)["public_free_blocks"] == free_before)
+    check("伙伴块内容照旧",
+          call(base, "GET", "/api/disks/data/blocks/1")[1]["text"] == "pack-1")
+
+    print("\n[C6] 改写合装块：压不回 2 KiB → 只用公共空槽拆开")
+    raw = os.urandom(4096).hex()
+    slot2 = call(base, "GET", "/api/disks/data/blocks/2")[1]["pblock_id"]
+    code, body = call(base, "PUT", "/api/disks/data/blocks/2",
+                      {"data_hex": raw})
+    check("改写成功", code == 200, json.dumps(body, ensure_ascii=False))
+    check("动作 = overwrite_packed_split",
+          body.get("action") == "overwrite_packed_split")
+    check("计费 = public", body.get("charged") == "public")
+    check("换到公共新槽", body.get("pblock_id") != slot2)
+    check("公共余量减 1",
+          status(base)["public_free_blocks"] == free_before - 1)
+    check("改写块读回新数据",
+          call(base, "GET", "/api/disks/data/blocks/2")[1]["data_hex"] == raw)
+    b3 = call(base, "GET", "/api/disks/data/blocks/3")[1]
+    check("伙伴块留在原槽、内容照旧、恢复普通块",
+          b3["pblock_id"] == slot2 and b3["text"] == "pack-3"
+          and b3["packed"] is False)
+
+    print("\n[C7] 重新占满公共余量后，拆不开的改写被拒且状态不变")
+    for i in range(status(base)["public_free_blocks"]):
+        code, body = call(base, "PUT", f"/api/disks/sys/blocks/{i}",
+                          {"text": f"sys-{i}"})
+        assert code == 200, body
+    before = status(base)
+    check("公共余量再次为 0", before["public_free_blocks"] == 0)
+    code, body = call(base, "PUT", "/api/disks/data/blocks/4",
+                      {"data_hex": os.urandom(4096).hex()})
+    check("改写被拒 409 pool_full",
+          code == 409 and body.get("error", {}).get("code") == "pool_full",
+          json.dumps(body, ensure_ascii=False))
+    check("余量与状态完全未变", status(base) == before)
+    check("两块内容都保留",
+          call(base, "GET", "/api/disks/data/blocks/4")[1]["text"] == "pack-4"
+          and call(base, "GET", "/api/disks/data/blocks/5")[1]["text"] == "pack-5")
+    check("合装状态保留",
+          call(base, "GET", "/api/disks/data/blocks/4")[1]["packed"] is True)
+
+    print("\n[C8] 一致性自检")
+    diag = call(base, "GET", "/api/diagnostics")[1]
+    check("一致性自检通过", diag.get("ok") is True,
+          json.dumps(diag, ensure_ascii=False))
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     phase = "A"
@@ -249,8 +358,10 @@ def main() -> int:
         phase_a(base)
     elif phase.upper() == "B":
         phase_b(base)
+    elif phase.upper() == "C":
+        phase_c(base)
     else:
-        print("phase 只能是 A 或 B")
+        print("phase 只能是 A、B 或 C")
         return 2
 
     print()

@@ -609,3 +609,307 @@ def test_api_snapshot_delete_frees_space(client):
     assert st["snapshot"] is None
     assert st["public_free_blocks"] == 4
     assert st["live_blocks"] == 4
+
+
+# ------------------------------------------------------------------ packing
+
+def rnd_block(seed: int) -> bytes:
+    """Incompressible 4 KiB (zlib stays above the 2 KiB half-slot limit)."""
+    import random
+    return random.Random(seed).randbytes(BLOCK_SIZE)
+
+
+def test_pack_pairs_free_slots_and_readback(store):
+    for i in range(4):
+        store.write_block("data", i, blk(f"pack-me-{i}"))
+    assert store.status()["public_free_blocks"] == 4
+    res = store.pack_blocks("data", 0, 4)
+    assert res["packed_pairs"] == 2
+    assert res["freed_slots"] == 2
+    assert res["public_free_blocks"] == 6
+    st = store.status()
+    assert st["public_free_blocks"] == 6
+    assert st["live_blocks"] == 2
+    assert st["packed_pairs"] == 2
+    assert st["disks"]["data"]["packed_blocks"] == 4
+    # 每个块号仍读出完整 4 KiB 原文
+    for i in range(4):
+        b = store.read_block("data", i)
+        assert b["text"] == f"pack-me-{i}"
+        assert b["size"] == BLOCK_SIZE
+        assert b["packed"] is True
+        assert b["pack_half"] == i % 2
+        assert 0 < b["compressed_size"] <= BLOCK_SIZE // 2
+    listed = store.list_blocks("data")["blocks"]
+    assert all(b["packed"] for b in listed)
+    # 同一对的两个块号共享一个物理槽
+    assert listed[0]["pblock_id"] == listed[1]["pblock_id"]
+    assert listed[2]["pblock_id"] == listed[3]["pblock_id"]
+    assert listed[0]["pack_partner_lba"] == 1
+    assert listed[3]["pack_partner_lba"] == 2
+    assert store.check_consistency()["ok"]
+
+
+def test_pack_skips_and_is_idempotent(store):
+    store.write_block("data", 0, blk("a"))
+    store.write_block("data", 1, rnd_block(1))  # 压不进 2 KiB
+    store.write_block("data", 2, blk("c"))
+    # 范围 0..5：对 (0,1) 不可压，对 (2,3) 半数未分配，块 4 落单
+    res = store.pack_blocks("data", 0, 5)
+    assert res["packed_pairs"] == 0
+    assert res["skipped"]["incompressible"] == 1
+    assert res["skipped"]["unallocated"] == 1
+    assert store.status()["packed_pairs"] == 0
+    # 换成可压缩内容后补齐，再次合装成功
+    store.write_block("data", 1, blk("b"))
+    store.write_block("data", 3, blk("d"))
+    res = store.pack_blocks("data", 0, 4)
+    assert res["packed_pairs"] == 2
+    # 幂等：重复合装不再释放任何槽
+    res2 = store.pack_blocks("data", 0, 4)
+    assert res2["packed_pairs"] == 0
+    assert res2["skipped"]["already_packed"] == 2
+    assert res2["freed_slots"] == 0
+    assert store.check_consistency()["ok"]
+
+
+def test_pack_validates_input(store):
+    with pytest.raises(StoreError) as err:
+        store.pack_blocks("sys", 0, 2)
+    assert err.value.code == "pack_only_data"
+    with pytest.raises(StoreError) as err:
+        store.pack_blocks("snapshot", 0, 2)
+    assert err.value.code == "pack_only_data"
+    with pytest.raises(StoreError) as err:
+        store.pack_blocks("nope", 0, 2)
+    assert err.value.code == "unknown_disk"
+    for bad in (0, 65, -3):
+        with pytest.raises(StoreError) as err:
+            store.pack_blocks("data", 0, bad)
+        assert err.value.code == "bad_count"
+    with pytest.raises(StoreError) as err:
+        store.pack_blocks("data", -1, 2)
+    assert err.value.code == "bad_lba"
+
+
+def test_pack_works_when_public_free_is_zero(store):
+    # 8 个可压缩块把池占满，公共余量归零
+    for i in range(8):
+        store.write_block("data", i, blk(f"full-{i}"))
+    assert store.status()["public_free_blocks"] == 0
+    res = store.pack_blocks("data", 0, 8)
+    assert res["packed_pairs"] == 4
+    assert res["freed_slots"] == 4
+    # 释放的槽立即归公共余量，且立即可用
+    assert store.status()["public_free_blocks"] == 4
+    store.write_block("sys", 0, blk("uses-freed-slot"))
+    assert store.status()["public_free_blocks"] == 3
+    for i in range(8):
+        assert store.read_block("data", i)["text"] == f"full-{i}"
+    assert store.check_consistency()["ok"]
+
+
+def test_overwrite_packed_still_compressible_stays_in_slot(store):
+    store.write_block("data", 0, blk("aa"))
+    store.write_block("data", 1, blk("bb"))
+    store.pack_blocks("data", 0, 2)
+    slot = store.read_block("data", 0)["pblock_id"]
+    free_before = store.status()["public_free_blocks"]
+    r = store.write_block("data", 0, blk("aa-v2"))
+    assert r["action"] == "overwrite_packed"
+    assert r["charged"] == "none"
+    assert r["pblock_id"] == slot  # 留在原槽
+    assert store.status()["public_free_blocks"] == free_before
+    b0 = store.read_block("data", 0)
+    assert b0["text"] == "aa-v2"
+    assert b0["packed"] is True
+    # 伙伴块内容照旧，仍与改写块同槽
+    b1 = store.read_block("data", 1)
+    assert b1["text"] == "bb"
+    assert b1["pblock_id"] == slot
+    assert store.check_consistency()["ok"]
+
+
+def test_overwrite_packed_incompressible_splits_via_public_slot(store):
+    store.write_block("data", 0, blk("aa"))
+    store.write_block("data", 1, blk("bb"))
+    store.pack_blocks("data", 0, 2)
+    slot = store.read_block("data", 1)["pblock_id"]
+    free_before = store.status()["public_free_blocks"]
+    payload = rnd_block(7)
+    r = store.write_block("data", 0, payload)
+    assert r["action"] == "overwrite_packed_split"
+    assert r["charged"] == "public"
+    assert r["pblock_id"] != slot  # 只用公共空槽拆开
+    st = store.status()
+    assert st["public_free_blocks"] == free_before - 1
+    assert st["packed_pairs"] == 0
+    assert store.read_block("data", 0)["data_hex"] == payload.hex()
+    # 伙伴块留在原槽、内容照旧、恢复为普通块
+    b1 = store.read_block("data", 1)
+    assert b1["text"] == "bb"
+    assert b1["pblock_id"] == slot
+    assert b1["packed"] is False
+    assert store.check_consistency()["ok"]
+
+
+def test_overwrite_packed_split_rejected_without_public_free(store):
+    for i in range(8):
+        store.write_block("data", i, blk(f"v{i}"))
+    store.pack_blocks("data", 0, 8)  # 释放 4 槽
+    for i in range(4):
+        store.write_block("sys", i, blk(f"s{i}"))  # 重新占满
+    before = store.status()
+    assert before["public_free_blocks"] == 0
+    before_blocks = store.list_blocks("data")["blocks"]
+    with pytest.raises(StoreError) as err:
+        store.write_block("data", 0, rnd_block(9))
+    assert err.value.code == "pool_full"
+    assert err.value.status == 409
+    # 两块内容、合装状态和公共余量都保留
+    assert store.status() == before
+    assert store.list_blocks("data")["blocks"] == before_blocks
+    assert store.read_block("data", 0)["text"] == "v0"
+    assert store.read_block("data", 1)["text"] == "v1"
+    assert store.read_block("data", 0)["packed"] is True
+    assert store.read_block("data", 1)["packed"] is True
+    assert store.check_consistency()["ok"]
+
+
+def test_packed_blocks_survive_snapshot_cycle(store):
+    store.write_block("sys", 0, blk("sys0"))
+    store.write_block("data", 0, blk("d0"))
+    store.write_block("data", 1, blk("d1"))
+    store.pack_blocks("data", 0, 2)
+    store.create_snapshot(1)  # 快照只共享系统盘，与合装无冲突
+    assert store.read_block("data", 0)["packed"] is True
+    store.delete_snapshot()
+    assert store.read_block("data", 0)["text"] == "d0"
+    assert store.read_block("data", 1)["text"] == "d1"
+    assert store.status()["packed_pairs"] == 1
+    assert store.check_consistency()["ok"]
+
+
+def test_restart_preserves_packs_and_quota(tmp_path):
+    path = str(tmp_path / "pack_persist.db")
+    s = Store(path, total_blocks=8)
+    for i in range(6):
+        s.write_block("data", i, blk(f"keep-{i}"))
+    s.pack_blocks("data", 0, 6)          # 3 对，释放 3 槽
+    s.write_block("data", 0, blk("keep-0-v2"))  # 仍可合装：留在原槽
+    s.write_block("data", 2, rnd_block(3))      # 压不回：拆到公共槽
+    before = s.status()
+
+    s2 = Store(path)  # 重启：盘面与余量以已提交状态为准
+    assert s2.status() == before
+    assert s2.read_block("data", 0)["text"] == "keep-0-v2"
+    assert s2.read_block("data", 0)["packed"] is True
+    assert s2.read_block("data", 1)["text"] == "keep-1"
+    assert s2.read_block("data", 2)["data_hex"] == rnd_block(3).hex()
+    assert s2.read_block("data", 2)["packed"] is False
+    assert s2.read_block("data", 3)["text"] == "keep-3"
+    assert s2.read_block("data", 4)["packed"] is True
+    assert s2.check_consistency()["ok"]
+
+
+def test_concurrent_pack_and_writes_keep_invariant(tmp_path):
+    import concurrent.futures as cf
+
+    path = str(tmp_path / "race_pack.db")
+    s0 = Store(path, total_blocks=16)
+    for i in range(10):
+        s0.write_block("data", i, blk(f"c{i}"))
+
+    def attempt(i):
+        s = Store(path)
+        try:
+            if i % 3 == 0:
+                s.pack_blocks("data", 0, 10)
+                return "pack"
+            s.write_block("data", i % 10, blk(f"w{i}"))
+            return "write"
+        except StoreError as exc:
+            return exc.code
+
+    with cf.ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(attempt, range(30)))
+
+    s = Store(path)
+    st = s.status()
+    assert st["public_free_blocks"] >= 0
+    # 已确认的写入都保留：每个块号仍能读出完整 4 KiB
+    for i in range(10):
+        assert s.read_block("data", i)["size"] == BLOCK_SIZE
+    assert s.check_consistency()["ok"]
+
+
+def test_api_pack_flow(client):
+    for i in range(8):
+        assert client.put(f"/api/disks/data/blocks/{i}",
+                          json={"text": f"p{i}"}).status_code == 200
+    assert client.get("/api/status").json()["public_free_blocks"] == 0
+    r = client.post("/api/disks/data/pack", json={"start_lba": 0, "count": 8})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["packed_pairs"] == 4
+    assert body["freed_slots"] == 4
+    assert body["public_free_blocks"] == 4
+    st = client.get("/api/status").json()
+    assert st["public_free_blocks"] == 4
+    assert st["packed_pairs"] == 4
+    assert st["disks"]["data"]["packed_blocks"] == 8
+    b = client.get("/api/disks/data/blocks/3").json()
+    assert b["text"] == "p3"
+    assert b["size"] == BLOCK_SIZE
+    assert b["packed"] is True
+    listed = client.get("/api/disks/data/blocks").json()["blocks"]
+    assert all(x["packed"] for x in listed)
+    assert client.get("/api/diagnostics").json()["ok"] is True
+
+
+def test_api_pack_rejects_bad_requests(client):
+    assert client.post("/api/disks/sys/pack",
+                       json={"start_lba": 0, "count": 2}).status_code == 400
+    r = client.post("/api/disks/data/pack", json={"start_lba": 0, "count": 65})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "bad_count"
+    r = client.post("/api/disks/data/pack", json={"start_lba": 0})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_request"
+    assert client.post("/api/disks/nope/pack",
+                       json={"start_lba": 0, "count": 2}).status_code == 404
+
+
+def test_api_packed_overwrite_outcomes(client):
+    client.put("/api/disks/data/blocks/0", json={"text": "x"})
+    client.put("/api/disks/data/blocks/1", json={"text": "y"})
+    client.post("/api/disks/data/pack", json={"start_lba": 0, "count": 2})
+    slot = client.get("/api/disks/data/blocks/0").json()["pblock_id"]
+    # 结果一：压缩后仍 ≤ 2 KiB，留在原槽
+    r = client.put("/api/disks/data/blocks/0", json={"text": "x2"})
+    assert r.json()["action"] == "overwrite_packed"
+    assert r.json()["pblock_id"] == slot
+    # 结果二：压不回 2 KiB，拆到公共空槽
+    raw = os.urandom(BLOCK_SIZE)
+    r = client.put("/api/disks/data/blocks/0", json={"data_hex": raw.hex()})
+    assert r.json()["action"] == "overwrite_packed_split"
+    assert r.json()["charged"] == "public"
+    assert client.get("/api/disks/data/blocks/0").json()["data_hex"] == raw.hex()
+    assert client.get("/api/disks/data/blocks/1").json()["text"] == "y"
+
+
+def test_api_packed_split_needs_public_slot(client):
+    for i in range(8):
+        client.put(f"/api/disks/data/blocks/{i}", json={"text": f"p{i}"})
+    client.post("/api/disks/data/pack", json={"start_lba": 0, "count": 8})
+    for i in range(4):
+        client.put(f"/api/disks/sys/blocks/{i}", json={"text": f"s{i}"})
+    before = client.get("/api/status").json()
+    assert before["public_free_blocks"] == 0
+    r = client.put("/api/disks/data/blocks/0",
+                   json={"data_hex": os.urandom(BLOCK_SIZE).hex()})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "pool_full"
+    assert client.get("/api/status").json() == before
+    assert client.get("/api/disks/data/blocks/0").json()["text"] == "p0"
+    assert client.get("/api/disks/data/blocks/1").json()["text"] == "p1"

@@ -71,6 +71,11 @@ class SnapshotBody(BaseModel):
     reserved_blocks: int
 
 
+class PackBody(BaseModel):
+    start_lba: int
+    count: int
+
+
 def _decode_block(body: WriteBody) -> bytes:
     provided = [
         name for name in ("text", "data_hex", "data_b64", "fill")
@@ -146,6 +151,11 @@ def put_block(request: Request, disk: str, lba: int, body: WriteBody) -> dict:
 @app.post("/api/snapshot")
 def create_snapshot(request: Request, body: SnapshotBody) -> dict:
     return _store(request).create_snapshot(body.reserved_blocks)
+
+
+@app.post("/api/disks/{disk}/pack")
+def pack_blocks(request: Request, disk: str, body: PackBody) -> dict:
+    return _store(request).pack_blocks(disk, body.start_lba, body.count)
 
 
 @app.delete("/api/snapshot")

@@ -66,6 +66,7 @@ main {
 .gauge .unit { color: var(--muted); font-size: .8rem; margin-left: .2rem; }
 .gauge.public strong { color: var(--good); }
 .gauge.reserved strong { color: var(--warn); }
+.gauge.packed strong { color: #7fe0b2; }
 
 .hint { color: var(--muted); font-size: .84rem; margin: .85rem 0 0; }
 
@@ -165,3 +166,4 @@ tr.shared td { color: #ff9f9f; }
   color: var(--muted);
 }
 .badge.shared { border-color: #7a3138; color: #ff9f9f; }
+.badge.packed { border-color: #2c6b4f; color: #7fe0b2; }

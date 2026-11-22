@@ -28,6 +28,7 @@ async function refreshStatus() {
     $("public-free").textContent = s.public_free_blocks;
     $("reserved-free").textContent = s.reserved_blocks;
     $("live-blocks").textContent = s.live_blocks;
+    $("packed-pairs").textContent = s.packed_pairs;
     $("total-blocks").textContent = s.total_blocks;
     const snap = s.snapshot;
     const info = $("snapshot-info");
@@ -44,7 +45,8 @@ async function refreshStatus() {
     $("status-note").textContent =
       `公共余量 = 总容量 ${s.total_blocks} − 已占用 ${s.live_blocks} − 快照预留 ${s.reserved_blocks}` +
       ` = ${s.public_free_blocks} 块（每块 ${s.block_size} 字节）。` +
-      `系统盘已用 ${s.disks.sys.allocated_blocks} 块，数据盘已用 ${s.disks.data.allocated_blocks} 块。`;
+      `系统盘已用 ${s.disks.sys.allocated_blocks} 块，数据盘已用 ${s.disks.data.allocated_blocks} 块` +
+      `（其中 ${s.disks.data.packed_blocks} 块处于合装，共 ${s.packed_pairs} 对）。`;
   } catch (err) {
     $("status-note").textContent = `读取状态失败：${err.message}`;
   }
@@ -58,12 +60,21 @@ async function readBlock() {
     showResult(
       `磁盘 ${b.disk} 块 ${b.lba} → 物理块 ${b.pblock_id}（${b.size} 字节）\n` +
       `共享标记：${b.shared_with_snapshot ? "是（只读共享）" : "否"}\n` +
+      `合装：${b.packed ? `是（第 ${b.pack_half} 半，压缩后 ${b.compressed_size} 字节）` : "否"}\n` +
       `文本：${b.text}`
     );
   } catch (err) {
     showResult(err.message, false);
   }
 }
+
+const ACTION_LABELS = {
+  first_write: "首次写入（占公共新槽）",
+  overwrite_private: "覆写私有块（原地，不占新槽）",
+  overwrite_shared: "覆写共享块（写时复制）",
+  overwrite_packed: "覆写合装块（仍可合装，留在原槽）",
+  overwrite_packed_split: "覆写合装块（压不回 2 KiB，拆到公共新槽）",
+};
 
 async function writeBlock() {
   const disk = $("disk-select").value;
@@ -80,12 +91,45 @@ async function writeBlock() {
     });
     showResult(
       `写入成功：${r.disk} 块 ${r.lba} → 物理块 ${r.pblock_id}\n` +
-      `类型：${r.action}，计费：${r.charged}\n` +
+      `类型：${ACTION_LABELS[r.action] || r.action}，计费：${r.charged}\n` +
       `公共余量 ${r.public_free_blocks} 块，预留余量 ${r.reservation_remaining_blocks} 块`
     );
     refreshStatus();
   } catch (err) {
     showResult(`写入失败：${err.message}`, false);
+    refreshStatus();
+  }
+}
+
+async function packBlocks() {
+  const start = parseInt($("pack-start").value, 10);
+  const count = parseInt($("pack-count").value, 10);
+  try {
+    const r = await api("/api/disks/data/pack", {
+      method: "POST",
+      body: JSON.stringify({ start_lba: start, count }),
+    });
+    const sk = r.skipped;
+    const lines = [
+      `合装完成：成功 ${r.packed_pairs} 对，实际释放 ${r.freed_slots} 个槽（已归还公共余量）`,
+      `公共余量现为 ${r.public_free_blocks} 块，已占用 ${r.live_blocks} 块`,
+    ];
+    if (r.pairs.length) {
+      lines.push("合装明细：" + r.pairs.map(
+        (p) => `块${p.lbas[0]}+块${p.lbas[1]}→槽${p.pblock_id}` +
+               `（${p.compressed_sizes[0]}B+${p.compressed_sizes[1]}B）`
+      ).join("；"));
+    }
+    const skips = [];
+    if (sk.unallocated) skips.push(`未分配 ${sk.unallocated} 对`);
+    if (sk.already_packed) skips.push(`已合装 ${sk.already_packed} 对`);
+    if (sk.incompressible) skips.push(`压缩后超 2 KiB ${sk.incompressible} 对`);
+    if (sk.shared) skips.push(`受保护 ${sk.shared} 对`);
+    if (skips.length) lines.push(`跳过：${skips.join("，")}`);
+    showResult(lines.join("\n"));
+    refreshStatus();
+  } catch (err) {
+    showResult(`合装失败：${err.message}`, false);
     refreshStatus();
   }
 }
@@ -135,15 +179,25 @@ async function listBlocks(disk) {
     for (const b of r.blocks) {
       const tr = document.createElement("tr");
       if (b.shared_with_snapshot) tr.classList.add("shared");
+      if (b.packed) tr.classList.add("packed");
+      const badges = [];
+      if (b.shared_with_snapshot) {
+        badges.push('<span class="badge shared">与快照共享</span>');
+      }
+      if (b.packed) {
+        badges.push(
+          `<span class="badge packed">合装·半${b.pack_half}·` +
+          `${b.compressed_size}B·配对块${b.pack_partner_lba}</span>`
+        );
+      }
+      if (!badges.length) badges.push('<span class="badge">独占</span>');
       tr.innerHTML =
         `<td>${r.disk}</td>` +
         `<td class="mono">${b.lba}</td>` +
         `<td class="mono">${b.pblock_id}</td>` +
         `<td>${b.size}</td>` +
         `<td>${escapeHtml(b.preview)}</td>` +
-        `<td>${b.shared_with_snapshot
-          ? '<span class="badge shared">与快照共享</span>'
-          : '<span class="badge">独占</span>'}</td>`;
+        `<td>${badges.join(" ")}</td>`;
       tbody.appendChild(tr);
     }
   } catch (err) {
@@ -171,6 +225,7 @@ async function runDiagnostics() {
 
 $("read-btn").addEventListener("click", readBlock);
 $("write-btn").addEventListener("click", writeBlock);
+$("pack-btn").addEventListener("click", packBlocks);
 $("create-snapshot").addEventListener("click", createSnapshot);
 $("delete-snapshot").addEventListener("click", deleteSnapshot);
 $("list-sys").addEventListener("click", () => listBlocks("sys"));

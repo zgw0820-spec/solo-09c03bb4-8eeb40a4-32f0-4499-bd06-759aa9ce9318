@@ -15,6 +15,12 @@ are carved out of the public free space but not yet materialised:
 * creating the snapshot                  -> requires ``R`` public free blocks
 * deleting the snapshot                  -> releases blocks referenced only by
   the snapshot plus the unused reservation
+* packing a data-disk range (pairs)      -> two blocks that each compress to
+  <= 2 KiB share one slot; one slot per pair returns to public free
+* overwrite of a packed block            -> stays in its slot while it still
+  compresses to <= 2 KiB; otherwise the pack is dissolved: the partner keeps
+  the original slot (restored to a plain block) and the rewritten block takes
+  one public slot; with no public slot the write is refused
 
 Every mutation runs in a single ``BEGIN IMMEDIATE`` transaction; on any error
 the transaction is rolled back, so a failed operation leaves the disk image and
@@ -28,6 +34,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import zlib
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -35,6 +42,11 @@ BLOCK_SIZE = 4096
 DISK_IDS = ("sys", "data")
 DISK_NAMES = {"sys": "系统盘", "data": "数据盘"}
 SNAPSHOT_ID = "snapshot"
+
+# 压缩合装：两个 4 KiB 块各自无损压缩后都不超过半个槽（2 KiB）时，
+# 合装进同一个物理槽。一次操作最多选定 64 个连续块号。
+PACK_HALF_LIMIT = BLOCK_SIZE // 2
+PACK_MAX_BLOCKS = 64
 
 
 class StoreError(Exception):
@@ -66,9 +78,19 @@ CREATE TABLE IF NOT EXISTS mappings (
     disk_id   TEXT NOT NULL CHECK (disk_id IN ('sys', 'data')),
     lba       INTEGER NOT NULL CHECK (lba >= 0),
     pblock_id INTEGER NOT NULL REFERENCES pblocks(id),
+    -- NULL: 普通块，独占 pblock；0/1: 合装块，pblock 内第 half 个压缩半块
+    half      INTEGER CHECK (half IN (0, 1)),
     PRIMARY KEY (disk_id, lba)
 );
 CREATE INDEX IF NOT EXISTS idx_mappings_pblock ON mappings(pblock_id);
+
+-- 合装槽的元数据：pblock 的 data 为 压缩半块0 || 压缩半块1，
+-- len0/len1 是两半各自的压缩后长度（均 <= PACK_HALF_LIMIT）。
+CREATE TABLE IF NOT EXISTS packs (
+    pblock_id INTEGER PRIMARY KEY REFERENCES pblocks(id) ON DELETE CASCADE,
+    len0      INTEGER NOT NULL CHECK (len0 > 0),
+    len1      INTEGER NOT NULL CHECK (len1 > 0)
+);
 
 -- At most one snapshot can exist; its id is pinned to 1.
 CREATE TABLE IF NOT EXISTS snapshot (
@@ -151,6 +173,13 @@ class Store:
                         raise
                     time.sleep(0.05)
             conn.executescript(SCHEMA)
+            # 旧库迁移：mappings 可能没有 half 列。
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(mappings)")}
+            if "half" not in cols:
+                conn.execute(
+                    "ALTER TABLE mappings ADD COLUMN half "
+                    "INTEGER CHECK (half IN (0, 1))"
+                )
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
@@ -245,6 +274,44 @@ class Store:
             "DELETE FROM pblocks WHERE id NOT IN (SELECT pblock_id FROM mappings) "
             "AND id NOT IN (SELECT pblock_id FROM snap_mappings)"
         )
+        conn.execute(
+            "DELETE FROM packs WHERE pblock_id NOT IN (SELECT id FROM pblocks)"
+        )
+
+    # ----------------------------------------------------------- pack helpers
+
+    def _pack_row(self, conn: sqlite3.Connection, pblock_id: int) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT p.data, k.len0, k.len1 FROM pblocks p "
+            "JOIN packs k ON k.pblock_id = p.id WHERE p.id = ?",
+            (pblock_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(
+                500, "pack_missing", f"物理块 {pblock_id} 缺少合装元数据"
+            )
+        return row
+
+    @staticmethod
+    def _halves(row: sqlite3.Row) -> tuple[bytes, bytes]:
+        blob = bytes(row["data"])
+        len0, len1 = int(row["len0"]), int(row["len1"])
+        return blob[:len0], blob[len0:len0 + len1]
+
+    def _inflate(self, comp: bytes, pblock_id: int) -> bytes:
+        try:
+            data = zlib.decompress(comp)
+        except zlib.error as exc:
+            raise StoreError(
+                500, "pack_corrupt", f"合装槽 {pblock_id} 解压失败"
+            ) from exc
+        if len(data) != self.block_size:
+            raise StoreError(
+                500, "pack_corrupt",
+                f"合装槽 {pblock_id} 解压后为 {len(data)} 字节，"
+                f"应为 {self.block_size}",
+            )
+        return data
 
     @staticmethod
     def _norm_disk(disk: str) -> str:
@@ -283,6 +350,9 @@ class Store:
                 "live_blocks": live,
                 "reserved_blocks": reserved_remaining,
                 "public_free_blocks": total - live - reserved_remaining,
+                "packed_pairs": int(
+                    conn.execute("SELECT COUNT(*) FROM packs").fetchone()[0]
+                ),
                 "snapshot": snap_info,
                 "disks": {
                     "sys": self._disk_summary(conn, "sys"),
@@ -292,7 +362,8 @@ class Store:
 
     def _disk_summary(self, conn: sqlite3.Connection, disk: str) -> dict:
         row = conn.execute(
-            "SELECT COUNT(*) AS n, COALESCE(MAX(lba), -1) AS max_lba "
+            "SELECT COUNT(*) AS n, COALESCE(MAX(lba), -1) AS max_lba, "
+            "COALESCE(SUM(half IS NOT NULL), 0) AS packed "
             "FROM mappings WHERE disk_id=?",
             (disk,),
         ).fetchone()
@@ -301,6 +372,7 @@ class Store:
             "name": DISK_NAMES[disk],
             "allocated_blocks": int(row["n"]),
             "size_blocks": int(row["max_lba"]) + 1,
+            "packed_blocks": int(row["packed"]),
         }
 
     # --------------------------------------------------------------- reads
@@ -309,6 +381,8 @@ class Store:
         self._norm_disk(disk)
         self._check_lba(lba)
         with self._read() as conn:
+            half = None
+            compressed_size = None
             if disk == SNAPSHOT_ID:
                 if self._snapshot(conn) is None:
                     raise StoreError(404, "no_snapshot", "当前没有快照")
@@ -319,7 +393,7 @@ class Store:
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT p.id AS pblock_id, p.data FROM mappings m "
+                    "SELECT p.id AS pblock_id, p.data, m.half FROM mappings m "
                     "JOIN pblocks p ON p.id=m.pblock_id "
                     "WHERE m.disk_id=? AND m.lba=?",
                     (disk, lba),
@@ -328,17 +402,29 @@ class Store:
                 raise StoreError(
                     404, "block_not_mapped", f"{disk} 的块 {lba} 尚未分配"
                 )
-            data = bytes(row["data"])
+            pblock_id = int(row["pblock_id"])
+            if disk != SNAPSHOT_ID and row["half"] is not None:
+                # 合装块：从槽内取出对应半块解压，逻辑上仍是完整 4 KiB。
+                half = int(row["half"])
+                c0, c1 = self._halves(self._pack_row(conn, pblock_id))
+                comp = c1 if half else c0
+                data = self._inflate(comp, pblock_id)
+                compressed_size = len(comp)
+            else:
+                data = bytes(row["data"])
             return {
                 "disk": disk,
                 "lba": lba,
-                "pblock_id": int(row["pblock_id"]),
+                "pblock_id": pblock_id,
                 "size": len(data),
                 "data_b64": self._b64(data),
                 "data_hex": data.hex(),
                 "text": self._as_text(data),
+                "packed": half is not None,
+                "pack_half": half,
+                "compressed_size": compressed_size,
                 "shared_with_snapshot": self._is_shared_with_other_disk(
-                    conn, disk, int(row["pblock_id"])
+                    conn, disk, pblock_id
                 ),
             }
 
@@ -350,14 +436,15 @@ class Store:
                 if self._snapshot(conn) is None:
                     raise StoreError(404, "no_snapshot", "当前没有快照")
                 rows = conn.execute(
-                    "SELECT m.lba, m.pblock_id, length(p.data) AS size, "
+                    "SELECT m.lba, m.pblock_id, NULL AS half, "
+                    "length(p.data) AS size, "
                     "substr(p.data, 1, 64) AS preview FROM snap_mappings m "
                     "JOIN pblocks p ON p.id=m.pblock_id ORDER BY m.lba LIMIT ?",
                     (limit,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT m.lba, m.pblock_id, length(p.data) AS size, "
+                    "SELECT m.lba, m.pblock_id, m.half, length(p.data) AS size, "
                     "substr(p.data, 1, 64) AS preview FROM mappings m "
                     "JOIN pblocks p ON p.id=m.pblock_id "
                     "WHERE m.disk_id=? ORDER BY m.lba LIMIT ?",
@@ -365,14 +452,39 @@ class Store:
                 ).fetchall()
             blocks = []
             for r in rows:
-                preview = bytes(r["preview"] or b"")
+                pblock_id = int(r["pblock_id"])
+                lba = int(r["lba"])
+                half = r["half"]
+                packed = half is not None
+                compressed_size = None
+                partner_lba = None
+                if packed:
+                    half = int(half)
+                    c0, c1 = self._halves(self._pack_row(conn, pblock_id))
+                    comp = c1 if half else c0
+                    compressed_size = len(comp)
+                    plain = self._inflate(comp, pblock_id)
+                    preview_data, size = plain[:64], len(plain)
+                    partner = conn.execute(
+                        "SELECT lba FROM mappings WHERE pblock_id=? "
+                        "AND disk_id=? AND lba<>?",
+                        (pblock_id, disk, lba),
+                    ).fetchone()
+                    partner_lba = None if partner is None else int(partner["lba"])
+                else:
+                    preview_data = bytes(r["preview"] or b"")
+                    size = int(r["size"])
                 blocks.append({
-                    "lba": int(r["lba"]),
-                    "pblock_id": int(r["pblock_id"]),
-                    "size": int(r["size"]),
-                    "preview": self._as_text(preview)[:40],
+                    "lba": lba,
+                    "pblock_id": pblock_id,
+                    "size": size,
+                    "preview": self._as_text(preview_data)[:40],
+                    "packed": packed,
+                    "pack_half": half,
+                    "compressed_size": compressed_size,
+                    "pack_partner_lba": partner_lba,
                     "shared_with_snapshot": self._is_shared_with_other_disk(
-                        conn, disk, int(r["pblock_id"])
+                        conn, disk, pblock_id
                     ),
                 })
             return {"disk": disk, "blocks": blocks, "count": len(blocks)}
@@ -401,7 +513,7 @@ class Store:
             )
         with self._txn() as conn:
             mapping = conn.execute(
-                "SELECT pblock_id FROM mappings WHERE disk_id=? AND lba=?",
+                "SELECT pblock_id, half FROM mappings WHERE disk_id=? AND lba=?",
                 (disk, lba),
             ).fetchone()
 
@@ -421,6 +533,10 @@ class Store:
                                           "first_write", "public")
 
             old_id = int(mapping["pblock_id"])
+            if mapping["half"] is not None:
+                # 合装块：仍能压进 2 KiB 就留在原槽，否则用公共空槽拆开。
+                return self._write_packed(conn, disk, lba, old_id,
+                                          int(mapping["half"]), data)
             if not self._is_shared_with_snapshot(conn, old_id):
                 # Private block: overwrite in place, no extra space needed.
                 conn.execute("UPDATE pblocks SET data=? WHERE id=?", (data, old_id))
@@ -454,6 +570,150 @@ class Store:
     def _insert_pblock(self, conn: sqlite3.Connection, data: bytes) -> int:
         cur = conn.execute("INSERT INTO pblocks(data) VALUES(?)", (data,))
         return int(cur.lastrowid)
+
+    def _write_packed(self, conn: sqlite3.Connection, disk: str, lba: int,
+                      pblock_id: int, half: int, data: bytes) -> dict:
+        """Overwrite one half of a packed slot.
+
+        Still fits (compressed <= 2 KiB) -> replace the half in place, the
+        slot and the partner are untouched.  No longer fits -> dissolve the
+        pack: the partner is restored to a normal block in the original slot
+        and the rewritten block takes a brand new public slot.  Without a
+        public slot the write is refused and the transaction rolls back, so
+        both blocks and the free space stay exactly as they were.
+        """
+        pack = self._pack_row(conn, pblock_id)
+        c0, c1 = self._halves(pack)
+        comp = zlib.compress(data)
+        if len(comp) <= PACK_HALF_LIMIT:
+            if half == 0:
+                blob, len0, len1 = comp + c1, len(comp), len(c1)
+            else:
+                blob, len0, len1 = c0 + comp, len(c0), len(comp)
+            conn.execute(
+                "UPDATE pblocks SET data=? WHERE id=?", (blob, pblock_id)
+            )
+            conn.execute(
+                "UPDATE packs SET len0=?, len1=? WHERE pblock_id=?",
+                (len0, len1, pblock_id),
+            )
+            return self._write_result(conn, disk, lba, pblock_id,
+                                      "overwrite_packed", "none")
+
+        if self._public_free(conn) <= 0:
+            raise StoreError(
+                409, "pool_full",
+                "改写后压不回 2 KiB，且公共余量为 0，无法拆出新槽；"
+                "改写被拒绝，两块内容与余量保持不变",
+            )
+        # 伙伴块在原槽恢复为普通 4 KiB 块，内容照旧。
+        partner = self._inflate(c1 if half == 0 else c0, pblock_id)
+        conn.execute(
+            "UPDATE pblocks SET data=? WHERE id=?", (partner, pblock_id)
+        )
+        conn.execute("DELETE FROM packs WHERE pblock_id=?", (pblock_id,))
+        conn.execute(
+            "UPDATE mappings SET half=NULL WHERE pblock_id=?", (pblock_id,)
+        )
+        # 被改写的块占用新的公共槽（未压缩的完整 4 KiB）。
+        new_id = self._insert_pblock(conn, data)
+        conn.execute(
+            "UPDATE mappings SET pblock_id=?, half=NULL "
+            "WHERE disk_id=? AND lba=?",
+            (new_id, disk, lba),
+        )
+        return self._write_result(conn, disk, lba, new_id,
+                                  "overwrite_packed_split", "public")
+
+    # -------------------------------------------------------------- packing
+
+    def pack_blocks(self, disk: str, start_lba: int, count: int) -> dict:
+        """Pack adjacent pairs of a contiguous data-disk range into slots.
+
+        Pairs are (start, start+1), (start+2, start+3), ...  A pair is
+        packed only when both blocks are allocated, unpacked, not shared,
+        and each compresses to <= 2 KiB; every packed pair frees exactly
+        one slot back to the public pool, inside the same transaction.
+        """
+        if disk not in DISK_IDS and disk != SNAPSHOT_ID:
+            raise StoreError(404, "unknown_disk", f"未知磁盘 {disk}")
+        if disk != "data":
+            raise StoreError(400, "pack_only_data", "只有数据盘支持压缩合装")
+        self._check_lba(start_lba)
+        if not isinstance(count, int) or isinstance(count, bool) \
+                or not 1 <= count <= PACK_MAX_BLOCKS:
+            raise StoreError(
+                400, "bad_count",
+                f"合装块数必须是 1..{PACK_MAX_BLOCKS} 的整数",
+            )
+        with self._txn() as conn:
+            pairs = []
+            skipped = {"unallocated": 0, "already_packed": 0,
+                       "shared": 0, "incompressible": 0}
+            for lba0 in range(start_lba, start_lba + count - 1, 2):
+                lba1 = lba0 + 1
+                rows = conn.execute(
+                    "SELECT lba, pblock_id, half FROM mappings "
+                    "WHERE disk_id=? AND lba IN (?, ?)",
+                    (disk, lba0, lba1),
+                ).fetchall()
+                by_lba = {int(r["lba"]): r for r in rows}
+                r0, r1 = by_lba.get(lba0), by_lba.get(lba1)
+                if r0 is None or r1 is None:
+                    skipped["unallocated"] += 1
+                    continue
+                if r0["half"] is not None or r1["half"] is not None:
+                    skipped["already_packed"] += 1
+                    continue
+                id0, id1 = int(r0["pblock_id"]), int(r1["pblock_id"])
+                if id0 == id1 \
+                        or self._is_shared_with_other_disk(conn, disk, id0) \
+                        or self._is_shared_with_other_disk(conn, disk, id1):
+                    skipped["shared"] += 1
+                    continue
+                d0 = bytes(conn.execute(
+                    "SELECT data FROM pblocks WHERE id=?", (id0,)
+                ).fetchone()["data"])
+                d1 = bytes(conn.execute(
+                    "SELECT data FROM pblocks WHERE id=?", (id1,)
+                ).fetchone()["data"])
+                c0, c1 = zlib.compress(d0), zlib.compress(d1)
+                if len(c0) > PACK_HALF_LIMIT or len(c1) > PACK_HALF_LIMIT:
+                    skipped["incompressible"] += 1
+                    continue
+                new_id = self._insert_pblock(conn, c0 + c1)
+                conn.execute(
+                    "INSERT INTO packs(pblock_id, len0, len1) VALUES(?,?,?)",
+                    (new_id, len(c0), len(c1)),
+                )
+                conn.execute(
+                    "UPDATE mappings SET pblock_id=?, half=0 "
+                    "WHERE disk_id=? AND lba=?",
+                    (new_id, disk, lba0),
+                )
+                conn.execute(
+                    "UPDATE mappings SET pblock_id=?, half=1 "
+                    "WHERE disk_id=? AND lba=?",
+                    (new_id, disk, lba1),
+                )
+                pairs.append({
+                    "lbas": [lba0, lba1],
+                    "pblock_id": new_id,
+                    "compressed_sizes": [len(c0), len(c1)],
+                })
+            # 被合装的两个旧槽失去引用，在同一事务内回收。
+            self._gc(conn)
+            return {
+                "disk": disk,
+                "start_lba": start_lba,
+                "count": count,
+                "packed_pairs": len(pairs),
+                "freed_slots": len(pairs),
+                "pairs": pairs,
+                "skipped": skipped,
+                "public_free_blocks": self._public_free(conn),
+                "live_blocks": self._live_blocks(conn),
+            }
 
     def _write_result(self, conn: sqlite3.Connection, disk: str, lba: int,
                       pblock_id: int, action: str, charged: str) -> dict:
@@ -551,6 +811,26 @@ class Store:
                 "ON p.id=m.pblock_id WHERE p.id IS NULL"
             ).fetchone()[0])
             unused_snapshot = self._snapshot(conn)
+            pack_orphan = int(conn.execute(
+                "SELECT COUNT(*) FROM packs k WHERE "
+                "NOT EXISTS(SELECT 1 FROM pblocks p WHERE p.id=k.pblock_id)"
+            ).fetchone()[0])
+            pack_bad_refs = int(conn.execute(
+                "SELECT COUNT(*) FROM packs k WHERE (SELECT COUNT(*) FROM "
+                "mappings m WHERE m.pblock_id=k.pblock_id AND m.half IS NOT NULL"
+                ") <> 2"
+            ).fetchone()[0])
+            half_without_pack = int(conn.execute(
+                "SELECT COUNT(*) FROM mappings m WHERE m.half IS NOT NULL AND "
+                "NOT EXISTS(SELECT 1 FROM packs k WHERE k.pblock_id=m.pblock_id)"
+            ).fetchone()[0])
+            pack_len_mismatch = int(conn.execute(
+                "SELECT COUNT(*) FROM packs k JOIN pblocks p "
+                "ON p.id=k.pblock_id WHERE k.len0 + k.len1 <> length(p.data)"
+            ).fetchone()[0])
+            ok = (orphan == 0 and dangling == 0 and public >= 0
+                  and pack_orphan == 0 and pack_bad_refs == 0
+                  and half_without_pack == 0 and pack_len_mismatch == 0)
             return {
                 "total_blocks": total,
                 "live_blocks": live,
@@ -558,6 +838,13 @@ class Store:
                 "public_free": public,
                 "orphan_blocks": orphan,
                 "dangling_refs": dangling,
+                "packed_pairs": int(conn.execute(
+                    "SELECT COUNT(*) FROM packs"
+                ).fetchone()[0]),
+                "pack_orphan_meta": pack_orphan,
+                "pack_bad_refcount": pack_bad_refs,
+                "packed_half_without_meta": half_without_pack,
+                "pack_length_mismatch": pack_len_mismatch,
                 "snapshot_present": unused_snapshot is not None,
-                "ok": orphan == 0 and dangling == 0 and public >= 0,
+                "ok": ok,
             }
