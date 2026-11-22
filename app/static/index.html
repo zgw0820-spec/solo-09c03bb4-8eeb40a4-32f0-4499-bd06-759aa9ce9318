@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>虚拟机块池 · 快照与配额</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header>
+  <h1>虚拟机块池 · 快照与配额</h1>
+  <p class="sub">两块虚拟盘共享固定容量的 4 KiB 块池。系统盘可建一份只读快照。</p>
+</header>
+
+<main>
+  <section class="card" id="status-card">
+    <h2>空间总览</h2>
+    <div class="gauges">
+      <div class="gauge public">
+        <span class="label">公共余量</span>
+        <strong id="public-free">–</strong>
+        <span class="unit">块</span>
+      </div>
+      <div class="gauge reserved">
+        <span class="label">快照预留余量</span>
+        <strong id="reserved-free">–</strong>
+        <span class="unit">块</span>
+      </div>
+      <div class="gauge muted">
+        <span class="label">已占用物理块</span>
+        <strong id="live-blocks">–</strong>
+        <span class="unit">块</span>
+      </div>
+      <div class="gauge muted">
+        <span class="label">池总容量</span>
+        <strong id="total-blocks">–</strong>
+        <span class="unit">块</span>
+      </div>
+    </div>
+    <p class="hint" id="status-note"></p>
+  </section>
+
+  <section class="card">
+    <h2>快照</h2>
+    <div id="snapshot-info" class="snapshot-info">当前没有快照。</div>
+    <div class="row">
+      <label>预留块数
+        <input id="reserve-input" type="number" min="0" value="4" />
+      </label>
+      <button id="create-snapshot">创建只读快照</button>
+      <button id="delete-snapshot" class="danger">删除快照</button>
+    </div>
+    <p class="hint">
+      创建快照会共享系统盘当前块，并从公共余量中预留指定块数；
+      覆写共用块时先用预留，预留用尽后使用公共余量。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>读 / 写 4 KiB 块</h2>
+    <div class="row">
+      <label>磁盘
+        <select id="disk-select">
+          <option value="sys">系统盘 (sys)</option>
+          <option value="data">数据盘 (data)</option>
+          <option value="snapshot">快照 (只读)</option>
+        </select>
+      </label>
+      <label>块号
+        <input id="lba-input" type="number" min="0" value="0" />
+      </label>
+    </div>
+    <div class="row">
+      <label class="grow">写入内容（UTF-8 文本，自动补零到 4096 字节）
+        <input id="text-input" type="text" value="hello block" />
+      </label>
+      <button id="write-btn">写入</button>
+      <button id="read-btn">读取</button>
+    </div>
+    <pre id="result" class="result">等待操作…</pre>
+  </section>
+
+  <section class="card">
+    <h2>块映射</h2>
+    <div class="row">
+      <button id="list-sys">系统盘块表</button>
+      <button id="list-data">数据盘块表</button>
+      <button id="list-snapshot">快照块表</button>
+    </div>
+    <p class="hint">红色表示该物理块仍被快照共享；此时写入系统盘会分配新块。</p>
+    <table id="blocks-table">
+      <thead>
+        <tr><th>盘</th><th>逻辑块号</th><th>物理块</th><th>大小</th><th>内容预览</th><th>状态</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>一致性自检</h2>
+    <button id="diag-btn">运行诊断</button>
+    <pre id="diag-result" class="result">未运行</pre>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
